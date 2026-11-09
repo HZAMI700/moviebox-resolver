@@ -25,8 +25,13 @@ const PORT = process.env.PORT || 10000;
 app.use(cors());
 app.use(express.json());
 
-const primarySession = new PrimarySession({ logger: createPrimaryLogger() });
-const fallbackSession = new FallbackSession({ logger: createFallbackLogger() });
+const MIRROR_HOSTS = [
+  'h5.aoneroom.com',
+  'v.moviebox.ph',
+  'moviebox.pk',
+  'netnaija.video',
+  'moviebox.ph',
+];
 
 const REQUIRED_HEADERS = {
   'User-Agent':
@@ -50,7 +55,7 @@ app.get('/health', (_req, res) => {
 });
 
 /**
- * Resolve direct MP4 download link from MovieBox
+ * Resolve direct MP4 download link from MovieBox across available mirrors
  */
 app.post('/api/moviebox/resolve', async (req, res) => {
   const { detailPath, type, season, episode, quality } = req.body || {};
@@ -71,65 +76,98 @@ app.post('/api/moviebox/resolve', async (req, res) => {
   const cleanDetailPath = detailPath.trim();
   const targetQuality = quality ? quality.toString().toLowerCase().replace('p', '') : 'best';
 
+  // Extract client IP if forwarded by proxy/CDN
+  const clientIp =
+    req.headers['x-forwarded-for']?.toString().split(',')[0].trim() ||
+    req.headers['x-real-ip']?.toString() ||
+    '105.101.44.12';
+
+  const defaultHeaders = {
+    'X-Forwarded-For': clientIp,
+    'X-Real-IP': clientIp,
+    'X-Client-Info': '{"timezone":"Africa/Cairo"}',
+  };
+
   let streamResult = null;
   let resolvedTitle = cleanDetailPath;
+  let lastError = null;
 
-  // 1. Attempt with primary SDK (moviebox-js-sdk)
-  try {
-    if (mediaType === 'episode') {
-      const sNum = parseInt(season, 10) || 1;
-      const eNum = parseInt(episode, 10) || 1;
-      try {
-        const seriesInfo = await getSeriesDetailsPrimary(primarySession, { detailPath: cleanDetailPath });
-        if (seriesInfo?.title) resolvedTitle = seriesInfo.title;
-      } catch (_) {}
-
-      streamResult = await getEpisodeStreamPrimary(primarySession, {
-        detailPath: cleanDetailPath,
-        season: sNum,
-        episode: eNum,
-        quality: targetQuality,
-      });
-    } else {
-      try {
-        const movieInfo = await getMovieDetailsPrimary(primarySession, { detailPath: cleanDetailPath });
-        if (movieInfo?.title) resolvedTitle = movieInfo.title;
-      } catch (_) {}
-
-      streamResult = await getMovieStreamPrimary(primarySession, {
-        detailPath: cleanDetailPath,
-        quality: targetQuality,
-      });
-    }
-  } catch (primaryErr) {
-    console.warn('[Resolver] Primary SDK failed, trying fallback scraper:', primaryErr.message);
-
-    // 2. Fallback to @weroperking/invenio-scraper
+  // Try each mirror host until successful
+  for (const host of MIRROR_HOSTS) {
     try {
+      const session = new PrimarySession({
+        logger: createPrimaryLogger(),
+        host,
+        defaultHeaders,
+      });
+
       if (mediaType === 'episode') {
         const sNum = parseInt(season, 10) || 1;
         const eNum = parseInt(episode, 10) || 1;
-        streamResult = await getEpisodeStreamFallback(fallbackSession, {
+        try {
+          const seriesInfo = await getSeriesDetailsPrimary(session, { detailPath: cleanDetailPath });
+          if (seriesInfo?.title) resolvedTitle = seriesInfo.title;
+        } catch (_) {}
+
+        streamResult = await getEpisodeStreamPrimary(session, {
           detailPath: cleanDetailPath,
           season: sNum,
           episode: eNum,
           quality: targetQuality,
         });
       } else {
-        streamResult = await getMovieStreamFallback(fallbackSession, {
+        try {
+          const movieInfo = await getMovieDetailsPrimary(session, { detailPath: cleanDetailPath });
+          if (movieInfo?.title) resolvedTitle = movieInfo.title;
+        } catch (_) {}
+
+        streamResult = await getMovieStreamPrimary(session, {
           detailPath: cleanDetailPath,
           quality: targetQuality,
         });
       }
-    } catch (fallbackErr) {
-      console.error('[Resolver] Both primary and fallback resolution failed:', fallbackErr.message);
-      return res.status(502).json({
-        error: `Failed to resolve stream from MovieBox: ${fallbackErr.message || primaryErr.message}`,
-      });
+
+      if (streamResult?.stream?.url || (Array.isArray(streamResult?.options) && streamResult.options.length > 0)) {
+        break;
+      }
+    } catch (err) {
+      lastError = err;
+      console.warn(`[Resolver] Mirror ${host} failed:`, err.message);
+
+      // Fallback scraper attempt on same host
+      try {
+        const fbSession = new FallbackSession({
+          logger: createFallbackLogger(),
+          host,
+          defaultHeaders,
+        });
+
+        if (mediaType === 'episode') {
+          const sNum = parseInt(season, 10) || 1;
+          const eNum = parseInt(episode, 10) || 1;
+          streamResult = await getEpisodeStreamFallback(fbSession, {
+            detailPath: cleanDetailPath,
+            season: sNum,
+            episode: eNum,
+            quality: targetQuality,
+          });
+        } else {
+          streamResult = await getMovieStreamFallback(fbSession, {
+            detailPath: cleanDetailPath,
+            quality: targetQuality,
+          });
+        }
+
+        if (streamResult?.stream?.url || (Array.isArray(streamResult?.options) && streamResult.options.length > 0)) {
+          break;
+        }
+      } catch (fbErr) {
+        lastError = fbErr;
+      }
     }
   }
 
-  // 3. Extract stream & select quality (exact match or highest available)
+  // Extract stream & select quality (exact match or highest available)
   const options = Array.isArray(streamResult?.options) ? streamResult.options : [];
   let selectedStream = streamResult?.stream;
 
@@ -152,12 +190,12 @@ app.post('/api/moviebox/resolve', async (req, res) => {
   }
 
   if (!selectedStream || !selectedStream.url) {
-    return res.status(404).json({
-      error: 'No playable MP4 download stream was found for this media.',
+    return res.status(502).json({
+      error: `Failed to resolve stream from MovieBox across all mirrors: ${lastError?.message || 'No stream found'}`,
     });
   }
 
-  // 4. Build output filename
+  // Build output filename
   let fileName = sanitizeFileName(resolvedTitle);
   if (mediaType === 'episode') {
     const sNum = (parseInt(season, 10) || 1).toString().padStart(2, '0');

@@ -1,0 +1,21 @@
+{
+  "name": "pulsar-moviebox-resolver",
+  "version": "1.0.0",
+  "description": "Standalone Node.js service resolving MovieBox media to direct MP4 download links",
+  "type": "module",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@weroperking/invenio-scraper": "^2.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.1",
+    "moviebox-js-sdk": "^1.0.0"
+  }
+}

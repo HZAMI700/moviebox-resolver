@@ -48,6 +48,90 @@ function sanitizeFileName(name) {
 }
 
 /**
+ * Searches MovieBox across multiple BFF endpoints by title/query to find a detailPath.
+ */
+async function searchDetailPath(query, mediaType) {
+  if (!query || typeof query !== 'string' || !query.trim()) return null;
+  const cleanQuery = query.trim();
+  const subjectType = mediaType === 'episode' ? 2 : 1;
+
+  const searchEndpoints = [
+    'https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/search',
+    'https://movieboxapp.in/wefeed-h5-bff/web/subject/search',
+    'https://h5.aoneroom.com/wefeed-h5-bff/web/subject/search',
+  ];
+
+  for (const endpoint of searchEndpoints) {
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': REQUIRED_HEADERS['User-Agent'],
+          'Referer': 'https://h5.aoneroom.com/',
+        },
+        body: JSON.stringify({
+          keyword: cleanQuery,
+          page: 1,
+          perPage: 10,
+          subjectType,
+        }),
+      });
+
+      if (!response.ok) continue;
+      const data = await response.json();
+      const items = data?.data?.items || data?.items || [];
+      if (Array.isArray(items) && items.length > 0) {
+        const matched = items.find((it) => it.detailPath) || items[0];
+        if (matched?.detailPath) {
+          return {
+            detailPath: matched.detailPath,
+            title: matched.title || cleanQuery,
+            subjectId: matched.subjectId,
+          };
+        }
+      }
+    } catch (err) {
+      console.warn(`[Search] Endpoint ${endpoint} failed:`, err.message);
+    }
+  }
+
+  // Fallback: search with subjectType 0 (all categories)
+  try {
+    const response = await fetch('https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/search', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': REQUIRED_HEADERS['User-Agent'],
+        'Referer': 'https://h5.aoneroom.com/',
+      },
+      body: JSON.stringify({
+        keyword: cleanQuery,
+        page: 1,
+        perPage: 10,
+        subjectType: 0,
+      }),
+    });
+    if (response.ok) {
+      const data = await response.json();
+      const items = data?.data?.items || data?.items || [];
+      if (Array.isArray(items) && items.length > 0) {
+        const matched = items.find((it) => it.detailPath) || items[0];
+        if (matched?.detailPath) {
+          return {
+            detailPath: matched.detailPath,
+            title: matched.title || cleanQuery,
+            subjectId: matched.subjectId,
+          };
+        }
+      }
+    }
+  } catch (_) {}
+
+  return null;
+}
+
+/**
  * Health check
  */
 app.get('/health', (_req, res) => {
@@ -55,26 +139,86 @@ app.get('/health', (_req, res) => {
 });
 
 /**
+ * Proxy streaming endpoint for clients that face CDN geoblocking or direct HTTP 429
+ */
+app.get('/api/moviebox/proxy', async (req, res) => {
+  const targetUrl = req.query.url;
+  if (!targetUrl || typeof targetUrl !== 'string') {
+    return res.status(400).send('Missing url parameter');
+  }
+
+  try {
+    const forwardHeaders = {
+      ...REQUIRED_HEADERS,
+    };
+    if (req.headers.range) {
+      forwardHeaders['Range'] = req.headers.range;
+    }
+
+    const upstream = await fetch(targetUrl, {
+      headers: forwardHeaders,
+    });
+
+    res.status(upstream.status);
+    for (const [key, val] of upstream.headers.entries()) {
+      if (['content-type', 'content-length', 'content-range', 'accept-ranges'].includes(key.toLowerCase())) {
+        res.setHeader(key, val);
+      }
+    }
+
+    const reader = upstream.body.getReader();
+    const pump = async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          res.end();
+          break;
+        }
+        res.write(value);
+      }
+    };
+    await pump();
+  } catch (err) {
+    if (!res.headersSent) {
+      res.status(502).send(err.message);
+    }
+  }
+});
+
+/**
  * Resolve direct MP4 download link from MovieBox across available mirrors
  */
 app.post('/api/moviebox/resolve', async (req, res) => {
-  const { detailPath, type, season, episode, quality } = req.body || {};
+  const { detailPath, title, query, type, season, episode, quality } = req.body || {};
 
-  if (!detailPath || typeof detailPath !== 'string' || !detailPath.trim()) {
-    return res.status(400).json({
-      error: 'Missing required field: detailPath must be a non-empty string.',
-    });
-  }
-
-  const mediaType = (type || 'movie').toLowerCase();
-  if (mediaType !== 'movie' && mediaType !== 'episode') {
-    return res.status(400).json({
-      error: 'Invalid field: type must be either "movie" or "episode".',
-    });
-  }
-
-  const cleanDetailPath = detailPath.trim();
+  const rawType = (type || 'movie').toLowerCase();
+  const mediaType = rawType === 'episode' || rawType === 'tv' ? 'episode' : 'movie';
   const targetQuality = quality ? quality.toString().toLowerCase().replace('p', '') : 'best';
+
+  let cleanDetailPath = (detailPath || '').toString().trim();
+  let resolvedTitle = (title || query || cleanDetailPath || 'video').toString().trim();
+
+  // If detailPath is empty, search by title or query
+  if (!cleanDetailPath) {
+    const searchQuery = title || query;
+    if (!searchQuery) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required field: detailPath or title/query must be provided.',
+      });
+    }
+
+    const found = await searchDetailPath(searchQuery, mediaType);
+    if (found && found.detailPath) {
+      cleanDetailPath = found.detailPath;
+      if (found.title) resolvedTitle = found.title;
+    } else {
+      return res.status(404).json({
+        success: false,
+        error: `Could not find MovieBox media matching query: "${searchQuery}"`,
+      });
+    }
+  }
 
   // Extract client IP if forwarded by proxy/CDN
   const clientIp =
@@ -89,7 +233,6 @@ app.post('/api/moviebox/resolve', async (req, res) => {
   };
 
   let streamResult = null;
-  let resolvedTitle = cleanDetailPath;
   let lastError = null;
 
   // Try each mirror host until successful
@@ -191,6 +334,7 @@ app.post('/api/moviebox/resolve', async (req, res) => {
 
   if (!selectedStream || !selectedStream.url) {
     return res.status(502).json({
+      success: false,
       error: `Failed to resolve stream from MovieBox across all mirrors: ${lastError?.message || 'No stream found'}`,
     });
   }
@@ -205,10 +349,19 @@ app.post('/api/moviebox/resolve', async (req, res) => {
     fileName = `${fileName}.mp4`;
   }
 
+  const hostHeader = req.get('host') || 'pulsar-moviebox-api.onrender.com';
+  const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+  const proxyUrl = `${protocol}://${hostHeader}/api/moviebox/proxy?url=${encodeURIComponent(selectedStream.url)}`;
+
   return res.status(200).json({
+    success: true,
     url: selectedStream.url,
+    proxyUrl,
     headers: REQUIRED_HEADERS,
     fileName,
+    quality: selectedStream.quality || targetQuality,
+    sizeBytes: selectedStream.sizeBytes || 0,
+    detailPath: cleanDetailPath,
   });
 });
 

@@ -36,7 +36,7 @@ const MIRROR_HOSTS = [
 const REQUIRED_HEADERS = {
   'User-Agent':
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Referer': 'https://h5.aoneroom.com/',
+  'Referer': 'https://movieboxapp.in/',
   'Accept': '*/*',
 };
 
@@ -164,6 +164,10 @@ app.get('/api/moviebox/proxy', async (req, res) => {
       if (['content-type', 'content-length', 'content-range', 'accept-ranges'].includes(key.toLowerCase())) {
         res.setHeader(key, val);
       }
+    }
+
+    if (!upstream.body) {
+      return res.end();
     }
 
     const reader = upstream.body.getReader();

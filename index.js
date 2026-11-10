@@ -238,6 +238,7 @@ app.post('/api/moviebox/resolve', async (req, res) => {
 
   let streamResult = null;
   let lastError = null;
+  let resolvedCaptions = [];
 
   // Try each mirror host until successful
   for (const host of MIRROR_HOSTS) {
@@ -254,6 +255,9 @@ app.post('/api/moviebox/resolve', async (req, res) => {
         try {
           const seriesInfo = await getSeriesDetailsPrimary(session, { detailPath: cleanDetailPath });
           if (seriesInfo?.title) resolvedTitle = seriesInfo.title;
+          if (Array.isArray(seriesInfo?.captions) && seriesInfo.captions.length > 0) {
+            resolvedCaptions = seriesInfo.captions;
+          }
         } catch (_) {}
 
         streamResult = await getEpisodeStreamPrimary(session, {
@@ -266,6 +270,9 @@ app.post('/api/moviebox/resolve', async (req, res) => {
         try {
           const movieInfo = await getMovieDetailsPrimary(session, { detailPath: cleanDetailPath });
           if (movieInfo?.title) resolvedTitle = movieInfo.title;
+          if (Array.isArray(movieInfo?.captions) && movieInfo.captions.length > 0) {
+            resolvedCaptions = movieInfo.captions;
+          }
         } catch (_) {}
 
         streamResult = await getMovieStreamPrimary(session, {
@@ -366,6 +373,7 @@ app.post('/api/moviebox/resolve', async (req, res) => {
     quality: selectedStream.quality || targetQuality,
     sizeBytes: selectedStream.sizeBytes || 0,
     detailPath: cleanDetailPath,
+    captions: resolvedCaptions,
   });
 });
 

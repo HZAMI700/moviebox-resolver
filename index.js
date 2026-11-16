@@ -143,9 +143,26 @@ app.get('/health', (_req, res) => {
  * Proxy streaming endpoint for clients that face CDN geoblocking or direct HTTP 429
  */
 app.get('/api/moviebox/proxy', async (req, res) => {
-  const targetUrl = req.query.url;
+  let targetUrl = req.query.url;
   if (!targetUrl || typeof targetUrl !== 'string') {
     return res.status(400).send('Missing url parameter');
+  }
+
+  // Re-attach query parameters if Express query parser separated them from targetUrl
+  if (req.query.sign && !targetUrl.includes('sign=')) {
+    targetUrl += (targetUrl.includes('?') ? '&' : '?') + `sign=${req.query.sign}`;
+  }
+  if (req.query.t && !targetUrl.includes('t=')) {
+    targetUrl += `&t=${req.query.t}`;
+  }
+  if (req.query.Policy && !targetUrl.includes('Policy=')) {
+    targetUrl += `&Policy=${req.query.Policy}`;
+  }
+  if (req.query.Signature && !targetUrl.includes('Signature=')) {
+    targetUrl += `&Signature=${req.query.Signature}`;
+  }
+  if (req.query['Key-Pair-Id'] && !targetUrl.includes('Key-Pair-Id=')) {
+    targetUrl += `&Key-Pair-Id=${req.query['Key-Pair-Id']}`;
   }
 
   const downloadName = req.query.filename || req.query.name;
@@ -165,6 +182,8 @@ app.get('/api/moviebox/proxy', async (req, res) => {
   try {
     const forwardHeaders = {
       ...REQUIRED_HEADERS,
+      'Accept-Encoding': 'identity',
+      'Origin': 'https://movieboxapp.in',
     };
     if (req.headers.range) {
       forwardHeaders['Range'] = req.headers.range;
@@ -172,7 +191,7 @@ app.get('/api/moviebox/proxy', async (req, res) => {
 
     let upstream = null;
 
-    // 1. Try direct fetch with required headers
+    // 1. Try direct fetch with required headers & identity encoding
     try {
       upstream = await fetch(targetUrl, {
         headers: forwardHeaders,

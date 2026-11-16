@@ -166,6 +166,13 @@ app.get('/api/moviebox/proxy', async (req, res) => {
       }
     }
 
+    const downloadName = req.query.filename || req.query.name;
+    if (downloadName || req.query.download === '1') {
+      const rawName = (downloadName || 'video').toString();
+      const cleanName = sanitizeFileName(rawName.endsWith('.mp4') ? rawName.slice(0, -4) : rawName) + '.mp4';
+      res.setHeader('Content-Disposition', `attachment; filename="${cleanName}"; filename*=UTF-8''${encodeURIComponent(cleanName)}`);
+    }
+
     if (!upstream.body) {
       return res.end();
     }

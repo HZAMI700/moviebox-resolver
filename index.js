@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import { Readable } from 'stream';
 import {
   MovieboxSession as PrimarySession,
   createNoopLogger as createPrimaryLogger,
@@ -147,6 +148,20 @@ app.get('/api/moviebox/proxy', async (req, res) => {
     return res.status(400).send('Missing url parameter');
   }
 
+  const downloadName = req.query.filename || req.query.name;
+  const isDownload = Boolean(downloadName || req.query.download === '1');
+  const rawName = (downloadName || 'video').toString();
+  const cleanName = sanitizeFileName(rawName.endsWith('.mp4') ? rawName.slice(0, -4) : rawName) + '.mp4';
+
+  const sendAttachmentHeader = () => {
+    if (isDownload) {
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${cleanName}"; filename*=UTF-8''${encodeURIComponent(cleanName)}`
+      );
+    }
+  };
+
   try {
     const forwardHeaders = {
       ...REQUIRED_HEADERS,
@@ -155,43 +170,72 @@ app.get('/api/moviebox/proxy', async (req, res) => {
       forwardHeaders['Range'] = req.headers.range;
     }
 
-    const upstream = await fetch(targetUrl, {
-      headers: forwardHeaders,
-    });
+    let upstream = null;
 
-    res.status(upstream.status);
-    for (const [key, val] of upstream.headers.entries()) {
-      if (['content-type', 'content-length', 'content-range', 'accept-ranges'].includes(key.toLowerCase())) {
-        res.setHeader(key, val);
-      }
+    // 1. Try direct fetch with required headers
+    try {
+      upstream = await fetch(targetUrl, {
+        headers: forwardHeaders,
+      });
+    } catch (e) {
+      console.warn('[Proxy] Direct fetch error:', e.message);
     }
 
-    const downloadName = req.query.filename || req.query.name;
-    if (downloadName || req.query.download === '1') {
-      const rawName = (downloadName || 'video').toString();
-      const cleanName = sanitizeFileName(rawName.endsWith('.mp4') ? rawName.slice(0, -4) : rawName) + '.mp4';
-      res.setHeader('Content-Disposition', `attachment; filename="${cleanName}"; filename*=UTF-8''${encodeURIComponent(cleanName)}`);
-    }
-
-    if (!upstream.body) {
-      return res.end();
-    }
-
-    const reader = upstream.body.getReader();
-    const pump = async () => {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          res.end();
-          break;
+    // 2. If direct fetch failed or CDN returned error (426, 428, 429, 403), forward through Botkeep node
+    if (!upstream || !upstream.ok || upstream.status === 426 || upstream.status === 428 || upstream.status === 429 || upstream.status === 403) {
+      try {
+        const botkeepUrl = `http://node19.botkeep.cloud:61151/api/moviebox/proxy?url=${encodeURIComponent(targetUrl)}`;
+        const bkRes = await fetch(botkeepUrl, {
+          headers: forwardHeaders,
+        });
+        if (bkRes && (bkRes.ok || bkRes.status === 200 || bkRes.status === 206)) {
+          upstream = bkRes;
         }
-        res.write(value);
+      } catch (bkErr) {
+        console.warn('[Proxy] Botkeep fallback error:', bkErr.message);
       }
-    };
-    await pump();
+    }
+
+    // 3. If upstream is available and OK (200 / 206)
+    if (upstream && (upstream.ok || upstream.status === 200 || upstream.status === 206)) {
+      res.status(upstream.status);
+      for (const [key, val] of upstream.headers.entries()) {
+        if (['content-type', 'content-length', 'content-range', 'accept-ranges'].includes(key.toLowerCase())) {
+          res.setHeader(key, val);
+        }
+      }
+      sendAttachmentHeader();
+
+      if (!upstream.body) {
+        return res.end();
+      }
+
+      if (typeof Readable?.fromWeb === 'function') {
+        const stream = Readable.fromWeb(upstream.body);
+        stream.on('error', (err) => {
+          console.warn('[Proxy] Stream error:', err.message);
+          if (!res.headersSent) res.status(502).end();
+        });
+        return stream.pipe(res);
+      } else {
+        const reader = upstream.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(value);
+        }
+        return res.end();
+      }
+    }
+
+    // 4. If all proxies fail, fallback to 302 redirect so browser attempts direct fetch
+    sendAttachmentHeader();
+    return res.redirect(302, targetUrl);
   } catch (err) {
+    console.error('[Proxy Error]:', err.message);
     if (!res.headersSent) {
-      res.status(502).send(err.message);
+      sendAttachmentHeader();
+      return res.redirect(302, targetUrl);
     }
   }
 });
